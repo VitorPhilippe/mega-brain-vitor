@@ -83,6 +83,10 @@ function sleep(ms) {
   return new Promise(r => setTimeout(r, ms));
 }
 
+function isValidProvider(p) {
+  return ['replicate', 'openai', 'local'].includes(String(p || '').toLowerCase());
+}
+
 // ─────────────────────────────────────────────────────────────
 // Step 1: Check Python
 // ─────────────────────────────────────────────────────────────
@@ -198,30 +202,63 @@ async function configureApiKeys() {
   stepHeader(4, 6, 'API Key Configuration');
 
   console.log();
-  console.log(chalk.dim('    Enter your API keys below. Press Enter to skip optional ones.'));
+  console.log(chalk.dim('    Enter your keys below. Press Enter to skip optional ones.'));
   console.log(chalk.dim('    Keys are stored locally in .env (never committed to git).'));
   console.log();
 
   const keys = {};
 
-  // --- OPENAI_API_KEY (REQUIRED) ---
+  // Transcription provider
+  console.log(`  ${chalk.cyan.bold('SELECT')} ${chalk.bold('TRANSCRIPTION_PROVIDER')} ${chalk.dim('- How to transcribe video/audio')}`);
+  const providerAnswer = await inquirer.prompt([
+    {
+      type: 'list',
+      name: 'value',
+      message: chalk.cyan('  Choose transcription provider:'),
+      choices: [
+        { name: 'Replicate (recommended for low effort / no GPU)', value: 'replicate' },
+        { name: 'OpenAI (Whisper API)', value: 'openai' },
+        { name: 'Local (run Whisper on this machine later)', value: 'local' },
+      ],
+      default: 'replicate',
+    },
+  ]);
+  keys.TRANSCRIPTION_PROVIDER = providerAnswer.value || 'replicate';
+  console.log();
+
+  // --- OPENAI_API_KEY (OPTIONAL) ---
   console.log(
-    `  ${chalk.red.bold('REQUIRED')} ${chalk.bold('OPENAI_API_KEY')} ${chalk.dim('- Whisper transcription for video/audio')}`
+    `  ${chalk.dim.bold('OPTIONAL')} ${chalk.bold('OPENAI_API_KEY')} ${chalk.dim('- Whisper transcription via OpenAI')}`
   );
   console.log(chalk.dim('    Get yours at: https://platform.openai.com/api-keys'));
   const openaiAnswer = await inquirer.prompt([
     {
       type: 'input',
       name: 'value',
-      message: chalk.cyan('  OpenAI API Key:'),
+      message: chalk.cyan('  OpenAI API Key (Enter to skip):'),
       validate: (input) => {
-        if (!input) return chalk.yellow('This key is required for /ingest to work with video/audio');
+        if (!input) return true; // allow empty
         if (!input.startsWith('sk-')) return chalk.yellow('OpenAI keys typically start with sk-');
         return true;
       },
     },
   ]);
   keys.OPENAI_API_KEY = openaiAnswer.value || '';
+  console.log();
+
+  // --- REPLICATE_API_TOKEN (OPTIONAL) ---
+  console.log(
+    `  ${chalk.dim.bold('OPTIONAL')} ${chalk.bold('REPLICATE_API_TOKEN')} ${chalk.dim('- Whisper transcription via Replicate')}`
+  );
+  console.log(chalk.dim('    Get yours at: https://replicate.com/account/api-tokens'));
+  const replicateAnswer = await inquirer.prompt([
+    {
+      type: 'input',
+      name: 'value',
+      message: chalk.cyan('  Replicate API Token (Enter to skip):'),
+    },
+  ]);
+  keys.REPLICATE_API_TOKEN = replicateAnswer.value || '';
   console.log();
 
   // --- VOYAGE_API_KEY (RECOMMENDED) ---
@@ -268,6 +305,23 @@ async function configureApiKeys() {
     keys.GOOGLE_CLIENT_SECRET = '';
   }
 
+  // Gentle warnings (no blocking)
+  const provider = String(keys.TRANSCRIPTION_PROVIDER || '').toLowerCase();
+  if (!isValidProvider(provider)) {
+    console.log(chalk.yellow(`    Warning: unknown TRANSCRIPTION_PROVIDER="${keys.TRANSCRIPTION_PROVIDER}". Defaulting to replicate.`));
+    keys.TRANSCRIPTION_PROVIDER = 'replicate';
+  }
+
+  if (provider === 'openai' && !keys.OPENAI_API_KEY) {
+    console.log(chalk.yellow('    Warning: TRANSCRIPTION_PROVIDER is openai but OPENAI_API_KEY is empty.'));
+  }
+  if (provider === 'replicate' && !keys.REPLICATE_API_TOKEN) {
+    console.log(chalk.yellow('    Warning: TRANSCRIPTION_PROVIDER is replicate but REPLICATE_API_TOKEN is empty.'));
+  }
+  if (provider === 'local') {
+    console.log(chalk.dim('    Note: Local transcription will be configured later (no API token required).'));
+  }
+
   return keys;
 }
 
@@ -280,15 +334,13 @@ async function validateKeys(keys) {
 
   const results = {};
 
-  // Validate OpenAI
+  // Validate OpenAI (only if provided)
   if (keys.OPENAI_API_KEY) {
     const spinner = ora({ text: 'Testing OpenAI connection...', indent: 4 }).start();
     try {
       const response = await fetch('https://api.openai.com/v1/models', {
         method: 'GET',
-        headers: {
-          'Authorization': `Bearer ${keys.OPENAI_API_KEY}`,
-        },
+        headers: { 'Authorization': `Bearer ${keys.OPENAI_API_KEY}` },
         signal: AbortSignal.timeout(10000),
       });
 
@@ -302,13 +354,42 @@ async function validateKeys(keys) {
         spinner.warn(chalk.yellow(`OpenAI returned HTTP ${response.status} - key may still work`));
         results.OPENAI_API_KEY = 'unknown';
       }
-    } catch (err) {
+    } catch {
       spinner.warn(chalk.yellow('Could not reach OpenAI API - check your network'));
       results.OPENAI_API_KEY = 'network_error';
     }
   } else {
     console.log(chalk.dim('    OpenAI: skipped (no key provided)'));
     results.OPENAI_API_KEY = 'skipped';
+  }
+
+  // Validate Replicate token (light check, only if provided)
+  if (keys.REPLICATE_API_TOKEN) {
+    const spinner = ora({ text: 'Testing Replicate token...', indent: 4 }).start();
+    try {
+      const response = await fetch('https://api.replicate.com/v1/account', {
+        method: 'GET',
+        headers: { 'Authorization': `Bearer ${keys.REPLICATE_API_TOKEN}` },
+        signal: AbortSignal.timeout(10000),
+      });
+
+      if (response.ok) {
+        spinner.succeed(chalk.green('Replicate token is valid'));
+        results.REPLICATE_API_TOKEN = 'valid';
+      } else if (response.status === 401) {
+        spinner.fail(chalk.red('Replicate token is invalid (401 Unauthorized)'));
+        results.REPLICATE_API_TOKEN = 'invalid';
+      } else {
+        spinner.warn(chalk.yellow(`Replicate returned HTTP ${response.status} - token may still work`));
+        results.REPLICATE_API_TOKEN = 'unknown';
+      }
+    } catch {
+      spinner.warn(chalk.yellow('Could not reach Replicate API - check your network'));
+      results.REPLICATE_API_TOKEN = 'network_error';
+    }
+  } else {
+    console.log(chalk.dim('    Replicate: skipped (no token provided)'));
+    results.REPLICATE_API_TOKEN = 'skipped';
   }
 
   // Validate Voyage
@@ -321,10 +402,7 @@ async function validateKeys(keys) {
           'Authorization': `Bearer ${keys.VOYAGE_API_KEY}`,
           'Content-Type': 'application/json',
         },
-        body: JSON.stringify({
-          input: ['test'],
-          model: 'voyage-3-lite',
-        }),
+        body: JSON.stringify({ input: ['test'], model: 'voyage-3-lite' }),
         signal: AbortSignal.timeout(10000),
       });
 
@@ -356,6 +434,9 @@ async function validateKeys(keys) {
     results.GOOGLE_OAUTH = 'skipped';
   }
 
+  // Provider status
+  results.TRANSCRIPTION_PROVIDER = isValidProvider(keys.TRANSCRIPTION_PROVIDER) ? 'set' : 'unknown';
+
   return results;
 }
 
@@ -379,7 +460,9 @@ async function generateEnvAndSummary(keys, validationResults, pythonResult, node
       '# Mega Brain - Environment Configuration',
       '# Generated by setup wizard',
       '',
+      'TRANSCRIPTION_PROVIDER=replicate',
       'OPENAI_API_KEY=',
+      'REPLICATE_API_TOKEN=',
       'VOYAGE_API_KEY=',
       'GOOGLE_CLIENT_ID=',
       'GOOGLE_CLIENT_SECRET=',
@@ -387,9 +470,23 @@ async function generateEnvAndSummary(keys, validationResults, pythonResult, node
     ].join('\n');
   }
 
+  // Ensure new keys exist in template even if env.example doesn't have them yet
+  if (!/^TRANSCRIPTION_PROVIDER=.*$/m.test(envContent)) {
+    envContent = envContent.replace(/^OPENAI_API_KEY=.*$/m, `TRANSCRIPTION_PROVIDER=${keys.TRANSCRIPTION_PROVIDER || 'replicate'}\nOPENAI_API_KEY=`);
+  }
+  if (!/^REPLICATE_API_TOKEN=.*$/m.test(envContent)) {
+    envContent = envContent.replace(/^OPENAI_API_KEY=.*$/m, `OPENAI_API_KEY=\nREPLICATE_API_TOKEN=`);
+  }
+
   // Fill in the values
+  if (keys.TRANSCRIPTION_PROVIDER) {
+    envContent = envContent.replace(/^TRANSCRIPTION_PROVIDER=.*$/m, `TRANSCRIPTION_PROVIDER=${keys.TRANSCRIPTION_PROVIDER}`);
+  }
   if (keys.OPENAI_API_KEY) {
     envContent = envContent.replace(/^OPENAI_API_KEY=.*$/m, `OPENAI_API_KEY=${keys.OPENAI_API_KEY}`);
+  }
+  if (keys.REPLICATE_API_TOKEN) {
+    envContent = envContent.replace(/^REPLICATE_API_TOKEN=.*$/m, `REPLICATE_API_TOKEN=${keys.REPLICATE_API_TOKEN}`);
   }
   if (keys.VOYAGE_API_KEY) {
     envContent = envContent.replace(/^VOYAGE_API_KEY=.*$/m, `VOYAGE_API_KEY=${keys.VOYAGE_API_KEY}`);
@@ -436,6 +533,7 @@ async function generateEnvAndSummary(keys, validationResults, pythonResult, node
       case true:
         return chalk.green('OK');
       case 'configured':
+      case 'set':
         return chalk.green('SET');
       case 'invalid':
         return chalk.red('FAIL');
@@ -465,8 +563,12 @@ async function generateEnvAndSummary(keys, validationResults, pythonResult, node
   summaryLines.push(`    Node.js ............ ${statusIcon(nodeResult.ok)}  ${chalk.dim(nodeResult.version || 'not found')}`);
   summaryLines.push(`    pip install ........ ${statusIcon(pipResult.ok)}  ${chalk.dim(pipResult.skipped ? 'skipped' : 'installed')}`);
   summaryLines.push('');
+  summaryLines.push(chalk.bold('  Transcription'));
+  summaryLines.push(`    Provider ........... ${statusIcon(validationResults.TRANSCRIPTION_PROVIDER)}  ${chalk.dim(keys.TRANSCRIPTION_PROVIDER || 'replicate')}`);
+  summaryLines.push('');
   summaryLines.push(chalk.bold('  API Keys'));
   summaryLines.push(`    OPENAI_API_KEY ..... ${statusIcon(validationResults.OPENAI_API_KEY)}  ${maskKey(keys.OPENAI_API_KEY)}`);
+  summaryLines.push(`    REPLICATE_API_TOKEN  ${statusIcon(validationResults.REPLICATE_API_TOKEN)}  ${maskKey(keys.REPLICATE_API_TOKEN)}`);
   summaryLines.push(`    VOYAGE_API_KEY ..... ${statusIcon(validationResults.VOYAGE_API_KEY)}  ${maskKey(keys.VOYAGE_API_KEY)}`);
   summaryLines.push(`    Google OAuth ....... ${statusIcon(validationResults.GOOGLE_OAUTH)}  ${keys.GOOGLE_CLIENT_ID ? maskKey(keys.GOOGLE_CLIENT_ID) : chalk.dim('not set')}`);
   summaryLines.push('');
@@ -481,38 +583,33 @@ async function generateEnvAndSummary(keys, validationResults, pythonResult, node
 
   // Next steps
   console.log();
-  const hasOpenAI = keys.OPENAI_API_KEY && validationResults.OPENAI_API_KEY !== 'invalid';
+  const provider = String(keys.TRANSCRIPTION_PROVIDER || '').toLowerCase();
 
-  if (hasOpenAI) {
-    console.log(boxen(
-      chalk.green.bold('  Setup complete!') + '\n\n'
-      + chalk.white('  Next steps:') + '\n'
-      + chalk.dim('  1. Open this project in Claude Code') + '\n'
-      + chalk.dim('  2. Drop a YouTube URL or PDF into inbox/') + '\n'
-      + chalk.dim('  3. Tell JARVIS: /ingest') + '\n\n'
-      + chalk.dim('  JARVIS will handle the rest.'),
-      {
-        padding: { top: 0, bottom: 0, left: 1, right: 1 },
-        margin: { left: 2 },
-        borderStyle: 'round',
-        borderColor: 'green',
-      }
-    ));
-  } else {
-    console.log(boxen(
-      chalk.yellow.bold('  Setup incomplete') + '\n\n'
-      + chalk.white('  Missing OPENAI_API_KEY:') + '\n'
-      + chalk.dim('  - Video/audio transcription will not work') + '\n'
-      + chalk.dim('  - Get a key at: https://platform.openai.com/api-keys') + '\n'
-      + chalk.dim('  - Then run: npx mega-brain-ai setup'),
-      {
-        padding: { top: 0, bottom: 0, left: 1, right: 1 },
-        margin: { left: 2 },
-        borderStyle: 'round',
-        borderColor: 'yellow',
-      }
-    ));
+  const notes = [];
+  notes.push(chalk.white('  Next steps:'));
+  notes.push(chalk.dim('  1. Open this project in Claude Code'));
+  notes.push(chalk.dim('  2. Drop a YouTube URL or PDF into inbox/'));
+  notes.push(chalk.dim('  3. Tell JARVIS: /ingest'));
+  notes.push('');
+  if (provider === 'replicate' && !keys.REPLICATE_API_TOKEN) {
+    notes.push(chalk.yellow('  Note: Provider is replicate but token is missing. Add REPLICATE_API_TOKEN in .env later.'));
   }
+  if (provider === 'openai' && !keys.OPENAI_API_KEY) {
+    notes.push(chalk.yellow('  Note: Provider is openai but key is missing. Add OPENAI_API_KEY in .env later.'));
+  }
+  if (provider === 'local') {
+    notes.push(chalk.dim('  Note: Local transcription will be configured later (Whisper on this machine).'));
+  }
+
+  console.log(boxen(
+    chalk.green.bold('  Setup complete!') + '\n\n' + notes.join('\n'),
+    {
+      padding: { top: 0, bottom: 0, left: 1, right: 1 },
+      margin: { left: 2 },
+      borderStyle: 'round',
+      borderColor: 'green',
+    }
+  ));
 
   console.log();
 }
